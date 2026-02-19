@@ -73,6 +73,12 @@ KEY_PEM_PATH = KEY_PEM_PATH.resolve()
 # libx264 for Jetson (Patch h264 Encoder)
 # ========================================================
 def jetson_software_encode_frame(self, frame: av.VideoFrame, force_keyframe: bool):
+    """
+    Monkey-patch for aiortc's H264Encoder to use software libx264 on Jetson.
+    What: Encodes a single VideoFrame to H.264 using libx264 with ultrafast/zerolatency.
+    Why: Jetson may lack or misconfigure hardware H.264; this ensures encoding works.
+    Used for: WebRTC video encoding when running on Jetson (e.g. NX, Orin).
+    """
     if self.codec and (frame.width != self.codec.width or frame.height != self.codec.height):
         self.codec = None
 
@@ -248,7 +254,12 @@ function stop() {
 # WebRTC publish
 # ========================================================
 class BGRArrayVideoStreamTrack(MediaStreamTrack):
-    """MediaStreamTrack exposing BGR ndarrays as av.VideoFrame (latest-frame semantics)."""
+    """
+    MediaStreamTrack exposing BGR ndarrays as av.VideoFrame (latest-frame semantics).
+    What: Bridges numpy BGR frames from the capture thread to WebRTC consumers.
+    Why: WebRTC expects MediaStreamTrack; we feed it from a queue to avoid blocking.
+    Used for: WebRTC video stream source in WebRTC_PublisherThread.
+    """
     kind = "video"
 
     def __init__(self):
@@ -258,12 +269,21 @@ class BGRArrayVideoStreamTrack(MediaStreamTrack):
         self._pts = 0
 
     async def recv(self) -> av.VideoFrame:
+        """
+        Yield the next video frame to WebRTC. Suspends until a frame is available,
+        preventing CPU busy-waiting. Called by aiortc when sending video to peers.
+        """
         # This will suspend execution until a frame is available
         # preventing CPU busy-waiting
         frame = await self._queue.get()
         return frame
 
     def push_frame(self, bgr_numpy: np.ndarray, loop: Optional[asyncio.AbstractEventLoop] = None):
+        """
+        Push a BGR numpy frame from the capture thread into the track's queue.
+        Converts to av.VideoFrame with RTP-compatible PTS; thread-safe via call_soon_threadsafe.
+        Used by WebRTC_PublisherThread to feed frames from the frame_queue.
+        """
         if bgr_numpy is None:
             return
 
@@ -293,6 +313,7 @@ class BGRArrayVideoStreamTrack(MediaStreamTrack):
             return
             
         def _put():
+            """Put frame into queue from the event loop; drops oldest if full (low-latency)."""
             try:
                 # Drop old frame if queue is full (Low Latency strategy)
                 if self._queue.full():
@@ -308,8 +329,12 @@ class WebRTC_PublisherThread(threading.Thread):
     """
     Runs aiohttp + aiortc in a separate THREAD (not Process).
     This enables shared memory and removes Pickling overhead.
+    What: Serves HTTPS + WebRTC offer/answer; encodes and streams BGR frames to browsers.
+    Why: WebRTC needs a dedicated event loop; thread allows sharing frames without pickling.
+    Used for: Low-latency browser video streaming (e.g. XR teleoperation viewer).
     """
     def __init__(self, port: int, host: str = "0.0.0.0", codec_pref: str = None):
+        """Set host/port/codec preference, create aiohttp app, register routes (/, /client.js, /offer), init frame queue and events."""
         super().__init__(daemon=True)
         self._host = host
         self._port = port
@@ -335,12 +360,15 @@ class WebRTC_PublisherThread(threading.Thread):
         self._app.router.add_options("/offer", self._options)
 
     async def _index(self, request: web.Request) -> web.Response:
+        """Serve the WebRTC viewer HTML page (GET /). Used when a client opens the stream URL."""
         return web.Response(content_type="text/html", text=INDEX_HTML)
     
     async def _javascript(self, request: web.Request) -> web.Response:
+        """Serve the client-side WebRTC JavaScript (GET /client.js). Needed for offer/answer and video display."""
         return web.Response(content_type="application/javascript", text=CLIENT_JS)
 
     async def _options(self, request):
+        """Handle CORS preflight (OPTIONS). Necessary for browsers when posting to /offer from another origin."""
         return web.Response(
             status=200,
             headers={
@@ -351,6 +379,11 @@ class WebRTC_PublisherThread(threading.Thread):
         )
 
     async def _offer(self, request: web.Request) -> web.Response:
+        """
+        Handle WebRTC SDP offer (POST /offer). Creates peer connection, subscribes to
+        MediaRelay for single encode, sets codec preference, returns SDP answer.
+        Core of the WebRTC signaling; required for each new viewer connection.
+        """
         params = await request.json()
         offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
@@ -395,6 +428,7 @@ class WebRTC_PublisherThread(threading.Thread):
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
+            """On peer disconnect/failure, remove and close the peer connection to free resources."""
             if pc.connectionState in ["failed", "closed"]:
                 await self._cleanup_pc(pc)
 
@@ -413,20 +447,27 @@ class WebRTC_PublisherThread(threading.Thread):
         )
 
     async def _cleanup_pc(self, pc):
+        """Remove and close a peer connection when it fails or closes. Keeps _pcs set in sync and frees resources."""
         self._pcs.discard(pc)
         try:
             await pc.close()
         except: pass
 
     def wait_for_start(self, timeout=1.0):
+        """Block until the HTTP/WebRTC server is listening (or timeout). Used by callers to know when it's safe to send frames."""
         return self._start_event.wait(timeout=timeout)
 
     def run(self):
+        """
+        Thread entry point. Creates asyncio loop, starts aiohttp with TLS, runs track/relay
+        and frame-push loop. Necessary so WebRTC runs in its own event loop without blocking main thread.
+        """
         # Create a new Event Loop for this thread
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         
         async def _main():
+            """Setup aiohttp with TLS, create BGR track and MediaRelay, then run frame-push loop until stop."""
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
             
@@ -462,7 +503,10 @@ class WebRTC_PublisherThread(threading.Thread):
             if self._loop: self._loop.close()
 
     def send(self, data: np.ndarray):
-        """Send data to the processing thread."""
+        """
+        Send a BGR frame to the WebRTC thread. Drops oldest frame if queue is full
+        to keep latency low. Used by ImageServer's WebRTC publisher threads to push camera frames.
+        """
         # Simple drop-frame logic if queue is full
         if not self._frame_queue.full():
             self._frame_queue.put(data)
@@ -473,6 +517,7 @@ class WebRTC_PublisherThread(threading.Thread):
             except: pass
 
     def stop(self):
+        """Signal the thread to stop and wait up to 1s for it to exit. Used during server shutdown."""
         self._stop_event.set()
         self.join(timeout=1.0)
 
@@ -481,17 +526,24 @@ class WebRTC_PublisherThread(threading.Thread):
 # WebRTC Manager
 # ========================================================
 class WebRTC_PublisherManager:
-    """Manages WebRTC_PublisherThreads."""
+    """
+    Singleton that manages WebRTC_PublisherThreads by (host, port).
+    What: Creates or reuses a WebRTC thread per (host, port); forwards frames via publish().
+    Why: Multiple cameras may use different ports; one thread per port avoids reconnection issues.
+    Used for: Central place for ImageServer to publish BGR frames to WebRTC without managing threads directly.
+    """
     _instance: Optional["WebRTC_PublisherManager"] = None
     _publisher_threads: Dict[Tuple[str, int], WebRTC_PublisherThread] = {}
     _lock = threading.Lock()
     _running = True
 
     def __init__(self):
+        """No-op; singleton state is class-level."""
         pass
 
     @classmethod
     def get_instance(cls) -> "WebRTC_PublisherManager":
+        """Return the singleton instance. Used so all code shares the same manager."""
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -499,6 +551,7 @@ class WebRTC_PublisherManager:
         return cls._instance
 
     def _create_publisher(self, port: int, host: str, codec_pref: str):
+        """Start a new WebRTC_PublisherThread for the given host/port/codec. Used when no thread exists for that key."""
         t = WebRTC_PublisherThread(port, host, codec_pref)
         t.start()
         if not t.wait_for_start(timeout=10.0):  # Increase timeout to 10 seconds
@@ -506,6 +559,7 @@ class WebRTC_PublisherManager:
         return t
 
     def _get_publisher(self, port, host, codec_pref):
+        """Return the WebRTC thread for (host, port), creating it if needed. Thread-safe via lock."""
         key = (host, port)
         with self._lock:
             if key not in self._publisher_threads:
@@ -513,6 +567,10 @@ class WebRTC_PublisherManager:
             return self._publisher_threads[key]
 
     def publish(self, data: Any, port: int, host: str = "0.0.0.0", codec_pref: str = None) -> None:
+        """
+        Publish a BGR frame (or compatible data) to the WebRTC stream on the given host/port.
+        Used by ImageServer's _webrtc_pub threads to send camera frames to connected browsers.
+        """
         if not self._running: return
         try:
             pub = self._get_publisher(port, host, codec_pref)
@@ -522,6 +580,7 @@ class WebRTC_PublisherManager:
             pass
 
     def close(self) -> None:
+        """Stop all publisher threads and clear the map. Called during ImageServer cleanup."""
         self._running = False
         with self._lock:
             for key, pub in list(self._publisher_threads.items()):
@@ -534,6 +593,12 @@ class WebRTC_PublisherManager:
 # UVC driver reload
 # ========================================================
 def reload_uvc_driver():
+    """
+    Unload and reload the kernel UVC (USB Video Class) driver.
+    What: Runs modprobe -r uvcvideo then modprobe uvcvideo debug=0.
+    Why: Ensures a clean state so USB cameras are detected consistently (e.g. after replug).
+    Used for: CameraFinder initialization so device list is accurate.
+    """
     try:
         subprocess.run("sudo modprobe -r uvcvideo", shell=True, check=True)
         time.sleep(1)
@@ -554,6 +619,10 @@ class CameraFinder:
     uid: USB unique ID, e.g. "001:002"
     dev_info: extra info from uvc
     sn: serial number of the camera
+
+    What: Enumerates UVC and RealSense devices, builds maps (vpath, ppath, uid, serial).
+    Why: Config (cam_config_server.yaml) references cameras by serial or physical path; we need to resolve them.
+    Used for: ImageServer camera initialization and --cf (camera find) mode.
     """
     def __init__(self, realsense_enable=False, verbose=False):
         self.verbose = verbose
@@ -602,16 +671,20 @@ class CameraFinder:
 
     # utils
     def _list_video_paths(self):
+        """Return sorted list of /dev/video* paths from sysfs. Used to enumerate all V4L2 devices."""
         base = "/sys/class/video4linux/"
         if not os.path.exists(base):
             return []
         return [f"/dev/{x}" for x in sorted(os.listdir(base)) if x.startswith("video")]
 
     def _list_uvc_rgb_video_paths(self):
+        """Return video paths that are RGB-capable and not RealSense (i.e. UVC RGB cameras)."""
         return [p for p in self.video_paths if self._is_like_rgb(p) and p not in self.rs_video_paths]
 
     def _list_realsense_video_paths(self):
+        """Find /dev/video* nodes that belong to Intel RealSense (by name and vendor id)."""
         def _read_text(path):
+            """Read first line of a sysfs file; used for idVendor, idProduct, name."""
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     return f.read().strip()
@@ -619,6 +692,7 @@ class CameraFinder:
                 return None
 
         def _parent_usb_device_sysdir(video_sysdir):
+            """Walk up from video device sysdir to find the USB device dir (has idVendor/idProduct)."""
             d = os.path.realpath(os.path.join(video_sysdir, "device"))
             for _ in range(10):
                 if d is None or d == "/" or not os.path.isdir(d):
@@ -647,6 +721,10 @@ class CameraFinder:
         return ports
     
     def get_realsense_module(self) -> object:
+        """
+        Import and return the pyrealsense2 module. Raises with install instructions if missing.
+        Used when RealSense support is enabled to query devices and open pipelines.
+        """
         try:
             import pyrealsense2 as rs
             return rs
@@ -677,6 +755,7 @@ class CameraFinder:
             raise RuntimeError(msg)
 
     def _list_realsense_serial_numbers(self):
+        """Query connected RealSense devices and return their serial numbers. Used to match config."""
         rs = self.get_realsense_module()
         ctx = rs.context()
         devices = ctx.query_devices()
@@ -689,11 +768,14 @@ class CameraFinder:
         return serials
 
     def _get_ppath_from_vpath(self, video_path):
+        """Resolve /dev/videoX to its physical sysfs path (realpath of device). Used for stable device identity."""
         sysfs_path = f"/sys/class/video4linux/{os.path.basename(video_path)}/device"
         return os.path.realpath(sysfs_path)
 
     def _get_uid_from_ppath(self, physical_path):
+        """Get USB bus:dev ID (e.g. '001:002') from a device physical path. UVC Capture uses uid."""
         def read_file(path):
+            """Read file contents as string or None if path missing; used for busnum/devnum."""
             return open(path).read().strip() if os.path.exists(path) else None
 
         busnum_file = os.path.join(physical_path, "busnum")
@@ -711,6 +793,7 @@ class CameraFinder:
         return None
 
     def _is_like_rgb(self, video_path):
+        """Open device and try to read one frame; return True if we get a 3-channel (BGR) frame. Filters RGB-capable devices."""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return False
@@ -722,18 +805,22 @@ class CameraFinder:
     # public api
     # --------------------------------------------------------
     def is_rs_serial_exist(self, serial_number):
+        """Return True if a RealSense with this serial is connected. Used to validate config."""
         return str(serial_number) in self.rs_serial_numbers
 
     def is_vpath_exist(self, vpath):
+        """Return True if this /dev/video* path exists in the enumerated list."""
         return vpath in self.video_paths
     
     def is_ppath_exist(self, physical_path):
+        """Return True if this physical path matches any known UVC RGB camera."""
         for cam in self.uvc_rgb_cameras.values():
             if cam.get("physical_path") == physical_path:
                 return True
         return False
     
     def get_uid_by_sn(self, serial_number):
+        """Resolve UVC serial number to USB uid (bus:dev). Used to open UVCCamera by serial."""
         matches = [
             cam for cam in self.uvc_rgb_cameras.values()
             if cam.get("serial_number") == str(serial_number)
@@ -745,18 +832,21 @@ class CameraFinder:
         return matches[0].get("uid")
 
     def get_uid_by_ppath(self, physical_path):
+        """Resolve physical path to USB uid. Used when config specifies physical_path for UVC."""
         for cam in self.uvc_rgb_cameras.values():
             if cam.get("physical_path") == physical_path:
                 return cam.get("uid")
         return None
     
     def get_uid_by_vpath(self, video_path):
+        """Return USB uid for a given /dev/video* path if it's in uvc_rgb_cameras."""
         cam = self.uvc_rgb_cameras.get(video_path)
         if cam:
             return cam.get("uid")
         return None
     
     def get_vpath_by_sn(self, serial_number):
+        """Resolve UVC serial number to /dev/videoX. Used to open OpenCVCamera by serial."""
         matches = []
         for cam in self.uvc_rgb_cameras.values():
             if cam.get("serial_number") == str(serial_number):
@@ -769,6 +859,7 @@ class CameraFinder:
         return matches[0]
 
     def get_vpath_by_ppath(self, physical_path):
+        """Resolve physical path to /dev/videoX (RGB device). Used to open OpenCVCamera by physical_path."""
         base = "/sys/class/video4linux/"
         matches = []
         for v in os.listdir(base):
@@ -785,6 +876,7 @@ class CameraFinder:
     
 
     def info(self):
+        """Log all discovered cameras (video paths, RealSense, UVC details). Used for --cf (camera find) output."""
         logger_mp.info("======================= Camera Discovery Start ==================================")
         logger_mp.info("Found video devices: %s", self.video_paths)
         logger_mp.info("Found RGB video devices: %s", self.uvc_rgb_video_paths)
@@ -824,6 +916,12 @@ class CameraFinder:
         logger_mp.info("=========================== Camera Discovery End ================================")
 
 class BaseCamera:
+    """
+    Base class for all camera backends (UVC, OpenCV, RealSense, IsaacSim).
+    What: Holds topic name, image shape, FPS, ZMQ/WebRTC buffers and ports.
+    Why: Single interface for ImageServer to start threads and read JPEG/BGR/depth.
+    Used for: Polymorphic camera handling in ImageServer.
+    """
     def __init__(self, cam_topic, img_shape, fps, 
                  enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
         self._ready = threading.Event()
@@ -846,59 +944,72 @@ class BaseCamera:
             self._webrtc_buffer = None
 
     def __str__(self):
+        """Human-readable camera description; subclasses override."""
         raise NotImplementedError
     
     def __repr__(self):
         return self.__str__()
 
     def _update_frame(self):
-        """Return a jepg frame as bytes, and a bgr frame as numpy array"""
+        """
+        Capture one frame and write JPEG to ZMQ buffer and/or BGR to WebRTC buffer.
+        Subclasses implement actual capture. Called by ImageServer _update_frames loop.
+        """
         raise NotImplementedError
     
     def wait_until_ready(self, timeout=None):
-        """Block until the camera is ready (first frame is available) or timeout occurs."""
+        """Block until the camera is ready (first frame is available) or timeout occurs. Used after start() before publishing."""
         return self._ready.wait(timeout=timeout)
 
     def enable_webrtc(self):
+        """Return whether WebRTC publishing is enabled for this camera."""
         return self._enable_webrtc
     
     def enable_zmq(self):
+        """Return whether ZMQ publishing is enabled for this camera."""
         return self._enable_zmq
 
     def get_jpeg_bytes(self):
+        """Read latest JPEG bytes from ZMQ buffer (for ZMQ publisher thread). Returns None if no frame."""
         jpeg_bytes = self._zmq_buffer.read() if self._enable_zmq and self._zmq_buffer else None
         return jpeg_bytes
 
     def get_bgr_frame(self):
+        """Read latest BGR numpy frame from WebRTC buffer (for WebRTC publisher thread). Returns None if no frame."""
         bgr_numpy = self._webrtc_buffer.read() if self._enable_webrtc and self._webrtc_buffer else None
         return bgr_numpy
 
     def get_depth_frame(self):
-        """Return a depth frame as bytes, or None if not supported. 
-           Before call this function, must first call get_frame() to update the latest depth data."""
+        """Return a depth frame as bytes, or None if not supported. RealSenseCamera overrides. Call after _update_frame for latest depth."""
         return None
 
     def get_zmq_port(self):
-        """Return the zmq port number the camera is serving on."""
+        """Return the ZMQ port number this camera publishes on."""
         return self._zmq_port
     
     def get_webrtc_port(self):
-        """Return the webrtc port number the camera is serving on."""
+        """Return the WebRTC port number this camera streams on."""
         return self._webrtc_port
     
     def get_webrtc_codec(self):
-        """Return the webrtc codec setting."""
+        """Return the WebRTC codec preference (e.g. 'h264', 'vp8')."""
         return self._webrtc_codec
 
     def get_fps(self):
-        """Return the camera FPS setting."""
+        """Return the configured frames-per-second for this camera."""
         return self._fps
 
     def release(self):
-        """Release camera resources."""
+        """Release camera resources (e.g. pipeline, capture, reader). Called during server shutdown."""
         raise NotImplementedError
 
 class RealSenseCamera(BaseCamera):
+    """
+    Camera backend using Intel RealSense (pyrealsense2). Supports color and optional depth.
+    What: Starts pipeline for one device by serial, aligns depth to color, fills ZMQ/WebRTC buffers.
+    Why: RealSense provides depth and high-quality color; config references devices by serial.
+    Used for: Cameras with type "realsense" in cam_config_server.yaml when --rs is set.
+    """
     def __init__(self, cam_topic, serial_number, img_shape, fps, 
                  enable_zmq=True, zmq_port = 55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None, enable_depth=False):
         rs = self.check_pyrealsense2_install()
@@ -937,6 +1048,7 @@ class RealSenseCamera(BaseCamera):
             raise RuntimeError(f"[RealSenseCamera] Failed to initialize RealSense camera {self._serial_number}: {e}")
 
     def __str__(self):
+        """String description of this RealSense camera (topic, resolution, FPS, ZMQ/WebRTC)."""
         return (
             f"[RealSenseCamera: {self._cam_topic}] initialized with "
             f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
@@ -945,6 +1057,7 @@ class RealSenseCamera(BaseCamera):
         )
 
     def check_pyrealsense2_install(self):
+        """Ensure pyrealsense2 is importable; raise ImportError with message if not. Called from __init__."""
         try:
             import pyrealsense2 as rs
             return rs
@@ -954,6 +1067,7 @@ class RealSenseCamera(BaseCamera):
             ) from e
     
     def _update_frame(self):
+        """Grab aligned color (and optionally depth) frame from pipeline; write to ZMQ and WebRTC buffers."""
         frames = self.pipeline.wait_for_frames()
         aligned_frames = self.align.process(frames)
         color_frame = aligned_frames.get_color_frame()
@@ -981,11 +1095,13 @@ class RealSenseCamera(BaseCamera):
             self._ready.set()
     
     def get_depth_frame(self):
+        """Return latest depth frame as bytes, or None if depth not enabled or not yet available."""
         if self._latest_depth is None:
             return None
         return self._latest_depth.tobytes()
 
     def release(self):
+        """Stop the RealSense pipeline and release the device. Called on server shutdown."""
         try:
             if hasattr(self.pipeline, "stop") and getattr(self.pipeline, "_running", False):
                 try:
@@ -998,6 +1114,12 @@ class RealSenseCamera(BaseCamera):
         logger_mp.info(f"[RealSenseCamera] Released {self._cam_topic}")
 
 class UVCCamera(BaseCamera):
+    """
+    Camera backend using UVC (uvc.Capture) by USB uid. Uses MJPG and get_frame_robust.
+    What: Opens Capture(uid), sets frame mode to match img_shape/fps, pushes JPEG/BGR to buffers.
+    Why: UVC gives direct control and often better compatibility than OpenCV on some USB cams.
+    Used for: Cameras with type "uvc" in config when physical_path or serial_number resolve to a uid.
+    """
     def __init__(self, cam_topic, uid, img_shape, fps, 
                  enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
@@ -1018,6 +1140,7 @@ class UVCCamera(BaseCamera):
             raise RuntimeError(f"[UVCCamera] Failed to set mode for {self._cam_topic}: {e}")
 
     def __str__(self):
+        """String description of this UVC camera (topic, resolution, FPS, ZMQ/WebRTC)."""
         return (
             f"[UVCCamera: {self._cam_topic}] initialized with "
             f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS, MJPG.\n"
@@ -1026,12 +1149,14 @@ class UVCCamera(BaseCamera):
         )
 
     def _choose_mode(self, cap, width=None, height=None, fps=None):
+        """Pick first UVC mode matching width, height, fps and MJPG. Raises ValueError if none match."""
         for m in cap.available_modes:
             if m.width == width and m.height == height and m.fps == fps and m.format_name == "MJPG":
                 return m
         raise ValueError("[UVCCamera] No matching uvc mode found")
 
     def _update_frame(self):
+        """Grab one frame via get_frame_robust; write JPEG and/or BGR to buffers."""
         if self.cap is not None:
             frame = self.cap.get_frame_robust() # get_frame(timeout=500)
             if frame is not None:
@@ -1049,19 +1174,17 @@ class UVCCamera(BaseCamera):
                 raise RuntimeError
 
     def release(self):
+        """Release UVC camera. Note: stop_streaming/close can hang on USB disconnect so we only log."""
         # if usbhub is plugged out, calling stop_streaming and close may hang forever.
-        # try:
-        #     self.cap.stop_streaming()
-        # except Exception:
-        #     pass
-        # try:
-        #     self.cap.close()
-        # except Exception:
-        #     pass
-        # self.cap = None
         logger_mp.info(f"[UVCCamera] Released {self._cam_topic}")
 
 class OpenCVCamera(BaseCamera):
+    """
+    Camera backend using OpenCV VideoCapture on /dev/videoX (V4L2, MJPG).
+    What: Opens device, sets resolution/FPS, reads BGR frames and feeds ZMQ/WebRTC buffers.
+    Why: Fallback when UVC is not used or for simple V4L2 devices.
+    Used for: Cameras with type "opencv" in config (by video_id, physical_path, or serial_number).
+    """
     def __init__(self, cam_topic, video_path, img_shape, fps, 
                  enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
@@ -1081,6 +1204,7 @@ class OpenCVCamera(BaseCamera):
             logger_mp.info(str(self))
 
     def __str__(self):
+        """String description of this OpenCV camera (topic, resolution, FPS, ZMQ/WebRTC)."""
         return (
             f"[OpenCVCamera: {self._cam_topic}] initialized with "
             f"{self._img_shape[0]}x{self._img_shape[1]} @ {self._fps} FPS.\n"
@@ -1089,10 +1213,12 @@ class OpenCVCamera(BaseCamera):
         )
         
     def _can_read_frame(self):
+        """Return True if one frame can be read (used at init to verify device works)."""
         success, _ = self.cap.read()
         return success
     
     def _update_frame(self):
+        """Read one BGR frame from VideoCapture; encode to JPEG for ZMQ and push BGR to WebRTC buffer."""
         if self.cap is not None:
             ret, bgr_numpy = self.cap.read()
             if ret:
@@ -1110,6 +1236,7 @@ class OpenCVCamera(BaseCamera):
                 raise RuntimeError
 
     def release(self):
+        """Release OpenCV VideoCapture. Called on server shutdown."""
         self.cap.release()
         self.cap = None
         logger_mp.info(f"[OpenCVCamera] Released {self._cam_topic}")
@@ -1144,6 +1271,7 @@ class IsaacSimCamera(BaseCamera):
         logger_mp.info(str(self))
 
     def __str__(self):
+        """String description of this IsaacSim camera (topic, source, binocular, ZMQ/WebRTC)."""
         mode = "binocular" if self._binocular else "monocular"
         return (
             f"[IsaacSimCamera: {self._cam_topic}] initialized with "
@@ -1153,6 +1281,7 @@ class IsaacSimCamera(BaseCamera):
         )
 
     def _update_frame(self):
+        """Read from shared memory (MultiImageReader): single source or left+right concatenated; write to ZMQ/WebRTC buffers."""
         # Get the image data based on source and binocular settings
         frame_data = None
         if self._binocular:
@@ -1192,6 +1321,7 @@ class IsaacSimCamera(BaseCamera):
         # If no data is available, just return silently and wait for next frame
 
     def release(self):
+        """Close the shared-memory image reader. Called on server shutdown."""
         if hasattr(self, 'multi_image_reader') and self.multi_image_reader is not None:
             self.multi_image_reader.close()
         self.multi_image_reader = None
@@ -1200,6 +1330,13 @@ class IsaacSimCamera(BaseCamera):
 # image server
 # ========================================================
 class ImageServer:
+    """
+    Main server that loads camera config, instantiates cameras (UVC/OpenCV/RealSense/IsaacSim),
+    and runs frame-capture and ZMQ/WebRTC publisher threads.
+    What: Parses cam_config, uses CameraFinder to resolve devices, creates one BaseCamera per topic, starts threads.
+    Why: Central orchestrator so one process can serve multiple cameras over ZMQ and WebRTC.
+    Used for: teleimager-server entry point and run_isaacsim_server().
+    """
     def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False):
         self._cam_config = cam_config
         self._realsense_enable = realsense_enable
@@ -1330,6 +1467,10 @@ class ImageServer:
         logger_mp.info("[Image Server] Image server has started, waiting for client connections...")
 
     def _update_frames(self, cam_topic: str, camera: BaseCamera):
+        """
+        Run in a dedicated thread: call camera._update_frame() at the camera's FPS.
+        Keeps ZMQ/WebRTC buffers filled. Stops when _stop_event is set or on exception.
+        """
         try:
             interval = 1.0 / camera.get_fps()
             next_frame_time = time.monotonic()
@@ -1351,6 +1492,10 @@ class ImageServer:
             self._stop_event.set()
 
     def _zmq_pub(self, cam_topic: str, camera: BaseCamera):
+        """
+        Run in a dedicated thread: read JPEG from camera's ZMQ buffer and publish via ZMQ at camera FPS.
+        Used for clients that consume JPEG over ZMQ (e.g. non-browser teleop).
+        """
         try:
             interval = 1.0 / camera.get_fps()
             next_frame_time = time.monotonic()
@@ -1375,6 +1520,10 @@ class ImageServer:
             self._stop_event.set()
     
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
+        """
+        Run in a dedicated thread: read BGR frame from camera's WebRTC buffer and publish via WebRTC_PublisherManager at camera FPS.
+        Used for browser-based low-latency video (e.g. XR teleoperation viewer).
+        """
         try:
             interval = 1.0 / camera.get_fps()
             webrtc_codec = camera.get_webrtc_codec()
@@ -1400,6 +1549,7 @@ class ImageServer:
             self._stop_event.set()
 
     def _clean_up(self):
+        """Stop responser, join publisher threads, close ZMQ/WebRTC managers, release all cameras. Called on stop or error."""
         self._responser.stop()
         for t in self._publisher_threads:
             if t.is_alive():
@@ -1427,6 +1577,10 @@ class ImageServer:
     # public api
     # --------------------------------------------------------
     def start(self):
+        """
+        Start all cameras: launch _update_frames thread per camera, wait until ready, then start _zmq_pub and _webrtc_pub threads.
+        Must be called after construction; blocks until cameras are ready or timeout.
+        """
         for camera_topic, camera in self._cameras.items():
             if camera is None:
                 logger_mp.error(f"[Image Server] Camera {camera_topic} failed to initialize previously, cannot start.")
@@ -1464,20 +1618,32 @@ class ImageServer:
                 self._publisher_threads.append(t)
 
     def wait(self):
+        """Block until _stop_event is set (e.g. SIGINT/SIGTERM), then run _clean_up. Used as the main run loop after start()."""
         self._stop_event.wait()
         self._clean_up()
 
     def stop(self):
+        """Signal the server to stop (sets _stop_event so wait() proceeds and cleanup runs). Called by signal_handler."""
         self._stop_event.set()
 
 # ========================================================
 # utility functions
 # ========================================================
 def signal_handler(server, signum, frame):
+    """
+    Handle SIGINT/SIGTERM: log and call server.stop() for graceful shutdown.
+    Registered in main() so Ctrl+C and kill stop the server cleanly.
+    """
     logger_mp.info(f"[Image Server] Received signal {signum}, initiating graceful shutdown...")
     server.stop()
 
 def set_performance_mode(cores=[0, 1, 2]):
+    """
+    Pin the process (and its threads) to the given CPU cores for more predictable latency.
+    What: Sets process CPU affinity via psutil. Requires sudo for full effect on some systems.
+    Why: Reduces context switching and can improve real-time camera/encoding performance.
+    Used for: main() when --no-affinity is not passed.
+    """
     import psutil
     try:
         p = psutil.Process(os.getpid())
@@ -1492,6 +1658,11 @@ def set_performance_mode(cores=[0, 1, 2]):
         logger_mp.error(f"[Performance] Error: {e}")
 
 def run_isaacsim_server():
+    """
+    Load cam_config_server.yaml, create ImageServer with isaacsim_enable=True, and start it.
+    Used when running inside Isaac Sim: cameras read from shared memory instead of hardware.
+    Returns the started ImageServer instance (caller typically waits or stops it).
+    """
     # Load config file, start image server
     try:
         with open(CONFIG_PATH, "r") as f:
@@ -1505,6 +1676,11 @@ def run_isaacsim_server():
     return server
 
 def main():
+    """
+    Entry point for teleimager-server. Parses CLI (--cf, --rs, --no-affinity), optionally sets
+    CPU affinity, runs camera finder (--cf) or loads config and starts ImageServer with signal handling.
+    Why: Single CLI to discover cameras, configure, and run the image server with graceful shutdown.
+    """
     logger_mp.info(
         "\n====================== Image Server Startup Guide ======================\n"
         "Please first read this repo's README.md to learn how to configure and use the teleimager.\n"
