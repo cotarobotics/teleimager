@@ -30,7 +30,10 @@ import yaml
 import os
 from collections import deque
 import logging_mp
-logger_mp = logging_mp.getLogger(__name__)
+_get_logger = getattr(logging_mp, "get_logger", None) or getattr(logging_mp, "getLogger", None)
+if _get_logger is None:
+    raise AttributeError("logging_mp has neither get_logger nor getLogger")
+logger_mp = _get_logger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
 # ========================================================
@@ -283,6 +286,11 @@ class ZMQ_PublisherManager:
 # ========================================================
 # ZMQ subscribe
 # ========================================================
+# For RGB: use ZMQ_SubscriberThread(host, port); recv() returns TeleImage with JPEG (and optional BGR).
+# For depth/IR (RealSense): connect to zmq_port_depth / zmq_port_ir / zmq_port_ir_aligned; each message is raw bytes:
+#   depth:       np.frombuffer(msg, dtype=np.uint16).reshape(height, width)
+#   ir:          np.frombuffer(msg, dtype=np.uint8).reshape(height, width)
+#   ir_aligned:  np.frombuffer(msg, dtype=np.uint8).reshape(height, width)  # same geometry as RGB
 class TeleImage:
     _NOT_SET = object()
     __slots__ = ['jpg', '_bgr', 'fps']
@@ -696,6 +704,16 @@ class ImageClient:
         
         if self._cam_config['head_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
+        # RealSense extra streams: depth, IR, aligned IR (raw bytes; no BGR decode)
+        head_cfg = self._cam_config.get('head_camera', {})
+        if head_cfg.get('enable_zmq_depth') and head_cfg.get('zmq_port_depth') is not None:
+            self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_depth'], request_bgr=False)
+        if head_cfg.get('enable_zmq_ir') and head_cfg.get('zmq_port_ir') is not None:
+            self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_ir'], request_bgr=False)
+        if head_cfg.get('enable_zmq_ir_aligned') and head_cfg.get('zmq_port_ir_aligned') is not None:
+            self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_ir_aligned'], request_bgr=False)
+        if head_cfg.get('enable_zmq_stereo_sbs') and head_cfg.get('zmq_port_stereo_sbs') is not None:
+            self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_stereo_sbs'], request_bgr=self._request_bgr)
 
         if self._cam_config['left_wrist_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
@@ -714,7 +732,35 @@ class ImageClient:
 
     def get_head_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['head_camera']['zmq_port'], request_bgr=self._request_bgr)
-    
+
+    def get_head_depth(self):
+        """Latest depth frame (RealSense). Returns TeleImage with .jpg = raw uint16 bytes; decode with np.frombuffer(..., dtype=np.uint16).reshape(h,w). Returns None if depth not enabled."""
+        head_cfg = self._cam_config.get('head_camera', {})
+        if not head_cfg.get('enable_zmq_depth') or head_cfg.get('zmq_port_depth') is None:
+            return None
+        return self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_depth'], request_bgr=False)
+
+    def get_head_ir(self):
+        """Latest raw IR frame (RealSense). Returns TeleImage with .jpg = raw uint8 bytes; decode with np.frombuffer(..., dtype=np.uint8).reshape(h,w). Returns None if IR not enabled."""
+        head_cfg = self._cam_config.get('head_camera', {})
+        if not head_cfg.get('enable_zmq_ir') or head_cfg.get('zmq_port_ir') is None:
+            return None
+        return self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_ir'], request_bgr=False)
+
+    def get_head_ir_aligned(self):
+        """Latest aligned IR frame (RealSense, same geometry as RGB). Returns TeleImage with .jpg = raw uint8 bytes; decode with np.frombuffer(..., dtype=np.uint8).reshape(h,w). Returns None if not enabled."""
+        head_cfg = self._cam_config.get('head_camera', {})
+        if not head_cfg.get('enable_zmq_ir_aligned') or head_cfg.get('zmq_port_ir_aligned') is None:
+            return None
+        return self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_ir_aligned'], request_bgr=False)
+
+    def get_head_stereo_sbs(self):
+        """Latest stereo side-by-side (left IR | right IR) as one JPEG/BGR. For Meta Quest 3: use this feed; in your app show left half to left eye, right half to right eye for depth. Returns None if not enabled."""
+        head_cfg = self._cam_config.get('head_camera', {})
+        if not head_cfg.get('enable_zmq_stereo_sbs') or head_cfg.get('zmq_port_stereo_sbs') is None:
+            return None
+        return self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_stereo_sbs'], request_bgr=self._request_bgr)
+
     def get_left_wrist_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
     
@@ -736,6 +782,13 @@ def main():
     client = ImageClient(host=args.host, request_bgr=True)
     cam_config = client.get_cam_config()
 
+    head_shape = cam_config.get('head_camera', {}).get('image_shape', [480, 640])
+    head_h, head_w = head_shape[0], head_shape[1]
+    has_head_depth = bool(cam_config.get('head_camera', {}).get('enable_zmq_depth'))
+    has_head_ir = bool(cam_config.get('head_camera', {}).get('enable_zmq_ir'))
+    has_head_ir_aligned = bool(cam_config.get('head_camera', {}).get('enable_zmq_ir_aligned'))
+    has_head_stereo_sbs = bool(cam_config.get('head_camera', {}).get('enable_zmq_stereo_sbs'))
+
     running = True
     while running:
         if cam_config['head_camera']['enable_zmq']:
@@ -744,7 +797,29 @@ def main():
                 logger_mp.info(f"Head Camera FPS: {head_img.fps:.2f}")
                 logger_mp.debug(f"Head Camera Shape: {cam_config['head_camera']['image_shape']}")
                 logger_mp.debug(f"Head Camera Binocular: {cam_config['head_camera']['binocular']}")
-                cv2.imshow("Head Camera", head_img.bgr)
+                cv2.imshow("Head Camera (RGB)", head_img.bgr)
+
+        if has_head_depth:
+            depth_tele = client.get_head_depth()
+            if depth_tele and depth_tele.jpg and len(depth_tele.jpg) == head_h * head_w * 2:
+                depth = np.frombuffer(depth_tele.jpg, dtype=np.uint16).reshape(head_h, head_w)
+                depth_vis = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+                cv2.imshow("Head Camera (Depth)", depth_vis)
+        if has_head_ir:
+            ir_tele = client.get_head_ir()
+            if ir_tele and ir_tele.jpg and len(ir_tele.jpg) == head_h * head_w:
+                ir = np.frombuffer(ir_tele.jpg, dtype=np.uint8).reshape(head_h, head_w)
+                cv2.imshow("Head Camera (IR)", ir)
+        if has_head_ir_aligned:
+            ir_a_tele = client.get_head_ir_aligned()
+            if ir_a_tele and ir_a_tele.jpg and len(ir_a_tele.jpg) == head_h * head_w:
+                ir_aligned = np.frombuffer(ir_a_tele.jpg, dtype=np.uint8).reshape(head_h, head_w)
+                cv2.imshow("Head Camera (IR Aligned)", ir_aligned)
+        if has_head_stereo_sbs:
+            stereo_sbs = client.get_head_stereo_sbs()
+            if stereo_sbs and stereo_sbs.bgr is not None:
+                cv2.imshow("Head Camera (Stereo SBS - Quest)", stereo_sbs.bgr)
 
         if cam_config['left_wrist_camera']['enable_zmq']:
             left_wrist_img = client.get_left_wrist_frame()
