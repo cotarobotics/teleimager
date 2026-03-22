@@ -714,6 +714,10 @@ class ImageClient:
             self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_ir_aligned'], request_bgr=False)
         if head_cfg.get('enable_zmq_stereo_sbs') and head_cfg.get('zmq_port_stereo_sbs') is not None:
             self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_stereo_sbs'], request_bgr=self._request_bgr)
+        if head_cfg.get('enable_zmq_stereo_pair') and head_cfg.get('zmq_port_stereo_left') is not None:
+            self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_stereo_left'], request_bgr=self._request_bgr)
+        if head_cfg.get('enable_zmq_stereo_pair') and head_cfg.get('zmq_port_stereo_right') is not None:
+            self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_stereo_right'], request_bgr=self._request_bgr)
 
         if self._cam_config['left_wrist_camera']['enable_zmq']:
             self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
@@ -761,6 +765,20 @@ class ImageClient:
             return None
         return self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_stereo_sbs'], request_bgr=self._request_bgr)
 
+    def get_head_stereo_left(self):
+        """Latest left-eye frame for stereo pair (separate port). For Meta Quest 3: display this to the left eye. Returns None if stereo pair not enabled."""
+        head_cfg = self._cam_config.get('head_camera', {})
+        if not head_cfg.get('enable_zmq_stereo_pair') or head_cfg.get('zmq_port_stereo_left') is None:
+            return None
+        return self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_stereo_left'], request_bgr=self._request_bgr)
+
+    def get_head_stereo_right(self):
+        """Latest right-eye frame for stereo pair (separate port). For Meta Quest 3: display this to the right eye. Returns None if stereo pair not enabled."""
+        head_cfg = self._cam_config.get('head_camera', {})
+        if not head_cfg.get('enable_zmq_stereo_pair') or head_cfg.get('zmq_port_stereo_right') is None:
+            return None
+        return self._subscriber_manager.subscribe(self._host, head_cfg['zmq_port_stereo_right'], request_bgr=self._request_bgr)
+
     def get_left_wrist_frame(self):
         return self._subscriber_manager.subscribe(self._host, self._cam_config['left_wrist_camera']['zmq_port'], request_bgr=self._request_bgr)
     
@@ -788,6 +806,7 @@ def main():
     has_head_ir = bool(cam_config.get('head_camera', {}).get('enable_zmq_ir'))
     has_head_ir_aligned = bool(cam_config.get('head_camera', {}).get('enable_zmq_ir_aligned'))
     has_head_stereo_sbs = bool(cam_config.get('head_camera', {}).get('enable_zmq_stereo_sbs'))
+    has_head_stereo_pair = bool(cam_config.get('head_camera', {}).get('enable_zmq_stereo_pair'))
 
     running = True
     while running:
@@ -820,6 +839,13 @@ def main():
             stereo_sbs = client.get_head_stereo_sbs()
             if stereo_sbs and stereo_sbs.bgr is not None:
                 cv2.imshow("Head Camera (Stereo SBS - Quest)", stereo_sbs.bgr)
+        if has_head_stereo_pair:
+            stereo_left = client.get_head_stereo_left()
+            stereo_right = client.get_head_stereo_right()
+            if stereo_left and stereo_left.bgr is not None:
+                cv2.imshow("Head Camera (Stereo Left)", stereo_left.bgr)
+            if stereo_right and stereo_right.bgr is not None:
+                cv2.imshow("Head Camera (Stereo Right)", stereo_right.bgr)
 
         if cam_config['left_wrist_camera']['enable_zmq']:
             left_wrist_img = client.get_left_wrist_frame()

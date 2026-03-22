@@ -5,7 +5,7 @@
 head_camera:
   # camera config
 
-  # Normal RGB stream: set to false to disable (e.g. to run only stereo SBS). Camera still starts if any other stream is enabled (depth, IR, stereo_sbs).
+  # Normal RGB stream: set to false to disable (e.g. to run only stereo pair for max FPS). Camera still starts if any other stream is enabled.
   enable_zmq: false
   # Port for RGB ZMQ (used when enable_zmq is true)
   zmq_port : 55555
@@ -55,14 +55,18 @@ head_camera:
   enable_zmq_ir_aligned: false
   zmq_port_ir_aligned: 55563
 
-  # Stereo SBS for Meta Quest 3: one JPEG feed = [left view | right view]. In your Quest app: decode, left half → left eye, right half → right eye for depth.
-  # stereo_sbs_mode: "ir" = left IR | right IR (grayscale). "color" = colour-aligned depth (RGB warped to left/right views).
-  # stereo_sbs_show_labels: set true to draw "LEFT"/"RIGHT" and borders on the feed so you can confirm it's real stereo (not a duplicate).
-  # To verify stereo: move a finger in front of the camera; it should appear at different horizontal positions in each half (parallax).
-  enable_zmq_stereo_sbs: true
+  # Stereo SBS: one JPEG = [left | right]. Set false when using only stereo pair for max FPS.
+  enable_zmq_stereo_sbs: false
   zmq_port_stereo_sbs: 55564
   stereo_sbs_mode: ir
-  stereo_sbs_show_labels: true
+  stereo_sbs_show_labels: false
+
+  # Stereo pair on separate ports for Meta Quest 3: left eye on one port, right eye on another.
+  # For maximum frame rate: set enable_zmq false, enable_zmq_stereo_sbs false, and only enable_zmq_stereo_pair true (with stereo_sbs_mode: ir). Server will then publish only IR1+IR2 and skip color/depth/align.
+  # HEADSET MAPPING: 55565 → left eye, 55566 → right eye.
+  enable_zmq_stereo_pair: true
+  zmq_port_stereo_left: 55565
+  zmq_port_stereo_right: 55566
 
 # =====================================================
 # Left wrist camera configuration

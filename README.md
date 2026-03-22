@@ -191,6 +191,40 @@ teleimager-server --rs
 
 
 
+### 1.4 Meta Quest 3 stereo (left/right on separate ports)
+
+To get **stereo vision on a Meta Quest 3** with the correct image in each eye:
+
+**1. Server config** (`cam_config_server.yaml` under `head_camera`):
+
+```yaml
+enable_zmq_stereo_pair: true
+zmq_port_stereo_left: 55565
+zmq_port_stereo_right: 55566
+stereo_sbs_mode: ir   # or "color" for warped RGB
+```
+
+**2. Port → eye mapping (use this so left/right are correct in the headset):**
+
+| Port   | Config key                | Send to headset eye |
+|--------|---------------------------|----------------------|
+| 55565  | `zmq_port_stereo_left`     | **Left** eye         |
+| 55566  | `zmq_port_stereo_right`    | **Right** eye        |
+
+The server publishes the RealSense **left** imager on 55565 and the **right** imager on 55566. For correct stereo, the headset must show the 55565 stream to the user’s **left** eye and the 55566 stream to the **right** eye.
+
+**3. Server:** Start with `teleimager-server --rs`.
+
+**4. Quest 3 app (or relay):**
+
+- Subscribe to `tcp://<server_ip>:55565` for the **left** eye texture.
+- Subscribe to `tcp://<server_ip>:55566` for the **right** eye texture.
+- In your render loop: decode each ZMQ message as JPEG → texture, then draw the 55565 texture to the **left** eye view and the 55566 texture to the **right** eye view.
+
+If stereo looks swapped (depth inverted), swap the two in the app only: draw 55565 to the right eye and 55566 to the left eye. Do not swap the server config.
+
+
+
 ## 2. Image Client
 
 The client module connects to the image server to receive and display multiple video streams. Designed for teleoperation scenarios.

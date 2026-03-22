@@ -926,7 +926,8 @@ class BaseCamera:
                  enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
                  enable_zmq_depth=False, zmq_port_depth=None, enable_zmq_ir=False, zmq_port_ir=None,
                  enable_zmq_ir_aligned=False, zmq_port_ir_aligned=None,
-                 enable_zmq_stereo_sbs=False, zmq_port_stereo_sbs=None):
+                 enable_zmq_stereo_sbs=False, zmq_port_stereo_sbs=None,
+                 enable_zmq_stereo_pair=False, zmq_port_stereo_left=None, zmq_port_stereo_right=None):
         self._ready = threading.Event()
         self._cam_topic = cam_topic
         self._img_shape = img_shape # (H, W)
@@ -965,6 +966,16 @@ class BaseCamera:
             self._zmq_buffer_stereo_sbs = TripleRingBuffer()
         else:
             self._zmq_buffer_stereo_sbs = None
+
+        self._enable_zmq_stereo_pair = enable_zmq_stereo_pair
+        self._zmq_port_stereo_left = zmq_port_stereo_left
+        self._zmq_port_stereo_right = zmq_port_stereo_right
+        if self._enable_zmq_stereo_pair:
+            self._zmq_buffer_stereo_left = TripleRingBuffer()
+            self._zmq_buffer_stereo_right = TripleRingBuffer()
+        else:
+            self._zmq_buffer_stereo_left = None
+            self._zmq_buffer_stereo_right = None
 
         self._enable_webrtc = enable_webrtc
         self._webrtc_port = webrtc_port
@@ -1029,6 +1040,18 @@ class BaseCamera:
             return self._zmq_buffer_stereo_sbs.read()
         return None
 
+    def get_stereo_left_jpeg_bytes(self):
+        """Read latest left-eye JPEG for stereo pair (separate port for Quest 3 left display). RealSenseCamera fills when enable_zmq_stereo_pair."""
+        if self._enable_zmq_stereo_pair and self._zmq_buffer_stereo_left:
+            return self._zmq_buffer_stereo_left.read()
+        return None
+
+    def get_stereo_right_jpeg_bytes(self):
+        """Read latest right-eye JPEG for stereo pair (separate port for Quest 3 right display). RealSenseCamera fills when enable_zmq_stereo_pair."""
+        if self._enable_zmq_stereo_pair and self._zmq_buffer_stereo_right:
+            return self._zmq_buffer_stereo_right.read()
+        return None
+
     def get_bgr_frame(self):
         """Read latest BGR numpy frame from WebRTC buffer (for WebRTC publisher thread). Returns None if no frame."""
         bgr_numpy = self._webrtc_buffer.read() if self._enable_webrtc and self._webrtc_buffer else None
@@ -1058,6 +1081,14 @@ class BaseCamera:
         """Return the ZMQ port for stereo SBS stream (left IR | right IR as one JPEG), or None if not enabled. Use for Quest 3: one feed, split for left/right eyes."""
         return self._zmq_port_stereo_sbs
 
+    def get_zmq_port_stereo_left(self):
+        """Return the ZMQ port for left-eye stereo stream (separate port for Quest 3 left display), or None if not enabled."""
+        return self._zmq_port_stereo_left
+
+    def get_zmq_port_stereo_right(self):
+        """Return the ZMQ port for right-eye stereo stream (separate port for Quest 3 right display), or None if not enabled."""
+        return self._zmq_port_stereo_right
+
     def get_webrtc_port(self):
         """Return the WebRTC port number this camera streams on."""
         return self._webrtc_port
@@ -1085,12 +1116,14 @@ class RealSenseCamera(BaseCamera):
                  enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
                  enable_depth=False, enable_zmq_depth=False, zmq_port_depth=None, enable_zmq_ir=False, zmq_port_ir=None,
                  enable_zmq_ir_aligned=False, zmq_port_ir_aligned=None,
-                 enable_zmq_stereo_sbs=False, zmq_port_stereo_sbs=None, stereo_sbs_mode="ir", stereo_sbs_show_labels=False):
+                 enable_zmq_stereo_sbs=False, zmq_port_stereo_sbs=None, stereo_sbs_mode="ir", stereo_sbs_show_labels=False,
+                 enable_zmq_stereo_pair=False, zmq_port_stereo_left=None, zmq_port_stereo_right=None):
         rs = self.check_pyrealsense2_install()
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
                          enable_zmq_depth=enable_zmq_depth, zmq_port_depth=zmq_port_depth, enable_zmq_ir=enable_zmq_ir, zmq_port_ir=zmq_port_ir,
                          enable_zmq_ir_aligned=enable_zmq_ir_aligned, zmq_port_ir_aligned=zmq_port_ir_aligned,
-                         enable_zmq_stereo_sbs=enable_zmq_stereo_sbs, zmq_port_stereo_sbs=zmq_port_stereo_sbs)
+                         enable_zmq_stereo_sbs=enable_zmq_stereo_sbs, zmq_port_stereo_sbs=zmq_port_stereo_sbs,
+                         enable_zmq_stereo_pair=enable_zmq_stereo_pair, zmq_port_stereo_left=zmq_port_stereo_left, zmq_port_stereo_right=zmq_port_stereo_right)
         self._serial_number = serial_number
         self._enable_depth = enable_depth
         self._latest_depth = None
@@ -1102,37 +1135,54 @@ class RealSenseCamera(BaseCamera):
         self._depth_to_color_extrinsics = None
         self._depth_to_right_extrinsics = None
         self._right_intrinsics = None
+        # Only enable color when needed (RGB publish, WebRTC, or stereo color mode) for max FPS when stereo pair ir-only
+        need_color = (
+            self._enable_zmq or self._enable_webrtc
+            or ((self._enable_zmq_stereo_sbs or self._enable_zmq_stereo_pair) and self._stereo_sbs_mode == "color")
+        )
+        need_depth = (
+            self._enable_depth or self._enable_zmq_depth or self._enable_zmq_ir_aligned
+            or ((self._enable_zmq_stereo_sbs or self._enable_zmq_stereo_pair) and self._stereo_sbs_mode == "color")
+        )
+        self._need_color = need_color
+        self._need_depth = need_depth
         try:
-            align_to = rs.stream.color
-            self.align = rs.align(align_to)
             self.pipeline = rs.pipeline()
             config = rs.config()
             config.enable_device(self._serial_number)
 
-            config.enable_stream(rs.stream.color, self._img_shape[1], self._img_shape[0], rs.format.bgr8, self._fps)
-            if self._enable_depth or self._enable_zmq_depth or self._enable_zmq_ir_aligned or self._enable_zmq_stereo_sbs:
+            if need_color:
+                align_to = rs.stream.color
+                self.align = rs.align(align_to)
+                config.enable_stream(rs.stream.color, self._img_shape[1], self._img_shape[0], rs.format.bgr8, self._fps)
+            else:
+                self.align = None
+            if need_depth:
                 config.enable_stream(rs.stream.depth, self._img_shape[1], self._img_shape[0], rs.format.z16, self._fps)
-            if self._enable_zmq_ir or self._enable_zmq_ir_aligned or self._enable_zmq_stereo_sbs:
+            if self._enable_zmq_ir or self._enable_zmq_ir_aligned or self._enable_zmq_stereo_sbs or self._enable_zmq_stereo_pair:
                 config.enable_stream(rs.stream.infrared, 1, self._img_shape[1], self._img_shape[0], rs.format.y8, self._fps)
-            if self._enable_zmq_stereo_sbs:
+            if self._enable_zmq_stereo_sbs or self._enable_zmq_stereo_pair:
                 config.enable_stream(rs.stream.infrared, 2, self._img_shape[1], self._img_shape[0], rs.format.y8, self._fps)
 
             profile = self.pipeline.start(config)
             self._device = profile.get_device()
             if self._device is None:
                 logger_mp.error('[RealSenseCamera] pipe_profile.get_device() is None .')
-            if self._enable_depth or self._enable_zmq_depth or self._enable_zmq_ir_aligned or self._enable_zmq_stereo_sbs:
+            if need_depth:
                 assert self._device is not None
                 depth_sensor = self._device.first_depth_sensor()
                 self.g_depth_scale = depth_sensor.get_depth_scale()
 
-            self.intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-            if self._enable_zmq_ir_aligned:
+            if need_color:
+                self.intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            else:
+                self.intrinsics = None
+            if self._enable_zmq_ir_aligned and need_color:
                 color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
                 ir_profile = profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
                 self._ir_intrinsics = ir_profile.get_intrinsics()
                 self._color_to_ir_extrinsics = color_profile.get_extrinsics_to(ir_profile)
-            if self._enable_zmq_stereo_sbs and self._stereo_sbs_mode == "color":
+            if (self._enable_zmq_stereo_sbs or self._enable_zmq_stereo_pair) and self._stereo_sbs_mode == "color" and need_depth and need_color:
                 depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
                 color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
                 ir2_profile = profile.get_stream(rs.stream.infrared, 2).as_video_stream_profile()
@@ -1264,14 +1314,18 @@ class RealSenseCamera(BaseCamera):
         return left_bgr, right_bgr
 
     def _update_frame(self):
-        """Grab aligned color, depth, and IR frames from pipeline; write to ZMQ and WebRTC buffers as configured."""
+        """Grab color, depth, and IR frames from pipeline; write to ZMQ and WebRTC buffers as configured. When only stereo pair (ir) is enabled, uses raw frames (no align) for max FPS."""
         frames = self.pipeline.wait_for_frames()
-        aligned_frames = self.align.process(frames)
-        color_frame = aligned_frames.get_color_frame()
-        if not color_frame:
-            return None
+        if self._need_color:
+            aligned_frames = self.align.process(frames)
+            color_frame = aligned_frames.get_color_frame()
+            if not color_frame:
+                return None
+            depth_frame = aligned_frames.get_depth_frame() if self._need_depth else None
+        else:
+            color_frame = None
+            depth_frame = frames.get_depth_frame() if self._need_depth else None
 
-        depth_frame = aligned_frames.get_depth_frame()
         if depth_frame:
             self._latest_depth = np.asanyarray(depth_frame.get_data())
             if self._enable_zmq_depth and self._zmq_buffer_depth is not None:
@@ -1279,7 +1333,7 @@ class RealSenseCamera(BaseCamera):
         else:
             self._latest_depth = None
 
-        ir_frame = frames.get_infrared_frame(1) if (self._enable_zmq_ir or self._enable_zmq_ir_aligned or self._enable_zmq_stereo_sbs) else None
+        ir_frame = frames.get_infrared_frame(1) if (self._enable_zmq_ir or self._enable_zmq_ir_aligned or self._enable_zmq_stereo_sbs or self._enable_zmq_stereo_pair) else None
         if ir_frame:
             ir_np = np.asanyarray(ir_frame.get_data())
             if self._enable_zmq_ir and self._zmq_buffer_ir is not None:
@@ -1288,25 +1342,36 @@ class RealSenseCamera(BaseCamera):
                 aligned_ir = self._warp_ir_to_color(self._latest_depth, ir_np)
                 if aligned_ir is not None:
                     self._zmq_buffer_ir_aligned.write(aligned_ir.tobytes())
-            if self._enable_zmq_stereo_sbs and self._zmq_buffer_stereo_sbs is not None:
-                if self._stereo_sbs_mode == "ir":
-                    ir_frame_2 = frames.get_infrared_frame(2)
-                    if ir_frame_2 is not None:
-                        ir_np_2 = np.asanyarray(ir_frame_2.get_data())
-                        left_ir = np.stack([ir_np, ir_np, ir_np], axis=-1) if len(ir_np.shape) == 2 else ir_np
-                        right_ir = np.stack([ir_np_2, ir_np_2, ir_np_2], axis=-1) if len(ir_np_2.shape) == 2 else ir_np_2
-                        if self._stereo_sbs_show_labels:
-                            cv2.putText(left_ir, "LEFT", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 2)
-                            cv2.putText(right_ir, "RIGHT", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 2)
+            if (self._enable_zmq_stereo_sbs or self._enable_zmq_stereo_pair) and self._stereo_sbs_mode == "ir":
+                ir_frame_2 = frames.get_infrared_frame(2)
+                if ir_frame_2 is not None:
+                    ir_np_2 = np.asanyarray(ir_frame_2.get_data())
+                    left_ir = np.stack([ir_np, ir_np, ir_np], axis=-1) if len(ir_np.shape) == 2 else ir_np
+                    right_ir = np.stack([ir_np_2, ir_np_2, ir_np_2], axis=-1) if len(ir_np_2.shape) == 2 else ir_np_2
+                    if self._stereo_sbs_show_labels:
+                        cv2.putText(left_ir, "LEFT", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 2)
+                        cv2.putText(right_ir, "RIGHT", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 2)
+                    if self._enable_zmq_stereo_sbs and self._zmq_buffer_stereo_sbs is not None:
                         sbs = np.hstack([left_ir, right_ir])
                         ok, buf = cv2.imencode(".jpg", sbs)
                         if ok:
                             self._zmq_buffer_stereo_sbs.write(buf.tobytes())
+                    if self._enable_zmq_stereo_pair and self._zmq_buffer_stereo_left is not None and self._zmq_buffer_stereo_right is not None:
+                        ok_l, buf_l = cv2.imencode(".jpg", left_ir)
+                        ok_r, buf_r = cv2.imencode(".jpg", right_ir)
+                        if ok_l:
+                            self._zmq_buffer_stereo_left.write(buf_l.tobytes())
+                        if ok_r:
+                            self._zmq_buffer_stereo_right.write(buf_r.tobytes())
+
+        if not self._need_color:
+            if not self._ready.is_set():
+                self._ready.set()
+            return
 
         bgr_numpy = np.asanyarray(color_frame.get_data())
 
-        if self._enable_zmq_stereo_sbs and self._zmq_buffer_stereo_sbs is not None and self._stereo_sbs_mode == "color":
-            if self._latest_depth is not None and self._depth_intrinsics is not None:
+        if self._stereo_sbs_mode == "color" and (self._enable_zmq_stereo_sbs or self._enable_zmq_stereo_pair) and self._latest_depth is not None and self._depth_intrinsics is not None:
                 result = self._warp_color_to_stereo(self._latest_depth, bgr_numpy)
                 if result is not None:
                     left_bgr, right_bgr = result
@@ -1314,10 +1379,18 @@ class RealSenseCamera(BaseCamera):
                         for img, label, color in ((left_bgr, "LEFT", (0, 255, 0)), (right_bgr, "RIGHT", (0, 0, 255))):
                             cv2.putText(img, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 2)
                             cv2.rectangle(img, (0, 0), (img.shape[1] - 1, img.shape[0] - 1), color, 3)
-                    sbs_color = np.hstack([left_bgr, right_bgr])
-                    ok, buf = cv2.imencode(".jpg", sbs_color)
-                    if ok:
-                        self._zmq_buffer_stereo_sbs.write(buf.tobytes())
+                    if self._enable_zmq_stereo_sbs and self._zmq_buffer_stereo_sbs is not None:
+                        sbs_color = np.hstack([left_bgr, right_bgr])
+                        ok, buf = cv2.imencode(".jpg", sbs_color)
+                        if ok:
+                            self._zmq_buffer_stereo_sbs.write(buf.tobytes())
+                    if self._enable_zmq_stereo_pair and self._zmq_buffer_stereo_left is not None and self._zmq_buffer_stereo_right is not None:
+                        ok_l, buf_l = cv2.imencode(".jpg", left_bgr)
+                        ok_r, buf_r = cv2.imencode(".jpg", right_bgr)
+                        if ok_l:
+                            self._zmq_buffer_stereo_left.write(buf_l.tobytes())
+                        if ok_r:
+                            self._zmq_buffer_stereo_right.write(buf_r.tobytes())
 
         if self._enable_webrtc:
             self._webrtc_buffer.write(bgr_numpy)
@@ -1596,6 +1669,7 @@ class ImageServer:
                     or cam_cfg.get("enable_zmq_ir", False)
                     or cam_cfg.get("enable_zmq_ir_aligned", False)
                     or cam_cfg.get("enable_zmq_stereo_sbs", False)
+                    or cam_cfg.get("enable_zmq_stereo_pair", False)
                 )
                 if not has_any_stream:
                     continue
@@ -1665,13 +1739,17 @@ class ImageServer:
                         zmq_port_stereo_sbs = cam_cfg.get("zmq_port_stereo_sbs", None)
                         stereo_sbs_mode = cam_cfg.get("stereo_sbs_mode", "ir")
                         stereo_sbs_show_labels = cam_cfg.get("stereo_sbs_show_labels", False)
+                        enable_zmq_stereo_pair = cam_cfg.get("enable_zmq_stereo_pair", False)
+                        zmq_port_stereo_left = cam_cfg.get("zmq_port_stereo_left", None)
+                        zmq_port_stereo_right = cam_cfg.get("zmq_port_stereo_right", None)
                         self._cameras[cam_topic] = RealSenseCamera(cam_topic, serial_number, img_shape, fps,
                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
                                                                    enable_depth=enable_depth, enable_zmq_depth=enable_zmq_depth,
                                                                    zmq_port_depth=zmq_port_depth, enable_zmq_ir=enable_zmq_ir, zmq_port_ir=zmq_port_ir,
                                                                    enable_zmq_ir_aligned=enable_zmq_ir_aligned, zmq_port_ir_aligned=zmq_port_ir_aligned,
                                                                    enable_zmq_stereo_sbs=enable_zmq_stereo_sbs, zmq_port_stereo_sbs=zmq_port_stereo_sbs,
-                                                                   stereo_sbs_mode=stereo_sbs_mode, stereo_sbs_show_labels=stereo_sbs_show_labels)
+                                                                   stereo_sbs_mode=stereo_sbs_mode, stereo_sbs_show_labels=stereo_sbs_show_labels,
+                                                                   enable_zmq_stereo_pair=enable_zmq_stereo_pair, zmq_port_stereo_left=zmq_port_stereo_left, zmq_port_stereo_right=zmq_port_stereo_right)
 
                 elif cam_type == "uvc":
                     uid = None
@@ -1879,6 +1957,35 @@ class ImageServer:
             logger_mp.error(f"[Image Server] Failed to publish ZMQ stereo SBS from {cam_topic} camera: {e}")
             self._stop_event.set()
 
+    def _zmq_pub_stereo_pair(self, cam_topic: str, camera: BaseCamera):
+        """
+        Run in a dedicated thread: read left and right JPEGs and publish on separate ZMQ ports at camera FPS.
+        For Meta Quest 3: subscribe to port_stereo_left for left eye and port_stereo_right for right eye to get stereo vision.
+        """
+        port_left = camera.get_zmq_port_stereo_left()
+        port_right = camera.get_zmq_port_stereo_right()
+        if port_left is None or port_right is None:
+            return
+        try:
+            interval = 1.0 / camera.get_fps()
+            next_frame_time = time.monotonic()
+            while not self._stop_event.is_set():
+                left_bytes = camera.get_stereo_left_jpeg_bytes()
+                right_bytes = camera.get_stereo_right_jpeg_bytes()
+                if left_bytes is not None:
+                    self._zmq_publisher_manager.publish(left_bytes, port_left)
+                if right_bytes is not None:
+                    self._zmq_publisher_manager.publish(right_bytes, port_right)
+                next_frame_time += interval
+                sleep_time = next_frame_time - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_frame_time = time.monotonic()
+        except Exception as e:
+            logger_mp.error(f"[Image Server] Failed to publish ZMQ stereo pair from {cam_topic} camera: {e}")
+            self._stop_event.set()
+
     def _webrtc_pub(self, cam_topic: str, camera: BaseCamera):
         """
         Run in a dedicated thread: read BGR frame from camera's WebRTC buffer and publish via WebRTC_PublisherManager at camera FPS.
@@ -1990,6 +2097,10 @@ class ImageServer:
                 self._publisher_threads.append(t)
             if camera.get_zmq_port_stereo_sbs() is not None:
                 t = threading.Thread(target=self._zmq_pub_stereo_sbs, args=(camera_topic, camera), daemon=True)
+                t.start()
+                self._publisher_threads.append(t)
+            if camera.get_zmq_port_stereo_left() is not None and camera.get_zmq_port_stereo_right() is not None:
+                t = threading.Thread(target=self._zmq_pub_stereo_pair, args=(camera_topic, camera), daemon=True)
                 t.start()
                 self._publisher_threads.append(t)
 
