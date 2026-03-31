@@ -5,13 +5,14 @@
 head_camera:
   # camera config
 
-  # if enable_zmq and enable_webrtc are both false, the camera will not start
-  # Set to true to enable ZMQ publishing, false to disable
+  # Keep this enabled for clients that require a "main ZMQ enabled" flag (e.g. immersive mode checks).
   enable_zmq: true
-  # Port to publish camera stream, e.g. zmq tcp://*:55555.  image_client.py should connect to the same port
+  # RGB stream publish toggle on zmq_port. Set false to keep ZMQ logically enabled but disable RGB publishing.
+  enable_zmq_rgb: true
+  # Port for RGB ZMQ (used when enable_zmq is true)
   zmq_port : 55555
-  # Set to true to enable WebRTC publishing, false to disable
-  enable_webrtc: true
+  # WebRTC (browser) RGB stream: set to false to disable
+  enable_webrtc: false
   # Port for WebRTC signaling server
   webrtc_port : 60001
   # webrtc codec preference, options: "vp8", "h264"
@@ -21,11 +22,15 @@ head_camera:
   #   - "opencv"    → opencv driver
   #   - "realsense" → pyrealsense2 driver
   #   - "uvc"       → pyuvc driver
-  type: uvc
+  # ZED (Mini, etc.): use "opencv" with video_id (UVC has no video_id fallback when serial is null).
+  type: opencv
 
   # Image Format
   # image resolution: [height, width]
-  image_shape: [480, 1280]
+  # ZED Mini UVC modes: VGA 1344x376, HD720 2560x720, HD1080 3840x1080 (SBS width = 2*per-eye)
+  # fourcc: ZED uses YUYV (not MJPG). Try HD720 first; bump to [1080, 3840] if stable.
+  image_shape: [720, 2560]
+  fourcc: YUYV
   binocular: true
   # frame per second
   fps: 30
@@ -43,40 +48,101 @@ head_camera:
   #   - type "realsense": supports serial_number only (but a RealSense can also be used as opencv/uvc if desired)
   #   - type "opencv":    supports video_id, serial_number, physical_path
   #   - type "uvc":       supports video_id, serial_number, physical_path
-  video_id: 0
-  serial_number: 01.00.00
-  physical_path: null
+  #   - ZED Mini (UVC): serial "unknown"; use physical_path for reliable lookup after UVC reload.
+  video_id: null
+  serial_number: null
+  physical_path: /sys/devices/platform/3610000.xhci/usb2/2-2/2-2.1/2-2.1:1.0
+  # RealSense ZMQ: publish depth, infrared, and aligned IR (connect client to these ports)
+  enable_depth: false
+  enable_zmq_depth: false
+  zmq_port_depth: 55561
+  enable_zmq_ir: false
+  zmq_port_ir: 55562
+  enable_zmq_ir_aligned: false
+  zmq_port_ir_aligned: 55563
+
+  # Stereo SBS for Meta Quest 3: one JPEG feed = [left view | right view]. In your Quest app: decode, left half → left eye, right half → right eye for depth.
+  # stereo_sbs_mode: "ir" = left IR | right IR (grayscale). "color" = colour-aligned depth (RGB warped to left/right views).
+  # stereo_sbs_show_labels: set true to draw "LEFT"/"RIGHT" and borders on the feed so you can confirm it's real stereo (not a duplicate).
+  # To verify stereo: move a finger in front of the camera; it should appear at different horizontal positions in each half (parallax).
+  enable_zmq_stereo_sbs: false
+  zmq_port_stereo_sbs: 55564
+  stereo_sbs_mode: ir
+  stereo_sbs_show_labels: false
+
+  # Stereo pair on separate ports for Meta Quest 3: left eye on one port, right eye on another.
+  # Uses same source as stereo_sbs (stereo_sbs_mode: "ir" or "color"). Each message is a single JPEG (left or right view).
+  # RealSense only — not used for OpenCV/UVC (e.g. ZED).
+  # HEADSET MAPPING (keep this to get correct stereo):
+  #   - zmq_port_stereo_left  (55565) → RealSense left imager  → display to user's LEFT  eye in headset
+  #   - zmq_port_stereo_right (55566) → RealSense right imager → display to user's RIGHT eye in headset
+  enable_zmq_stereo_pair: false
+  zmq_port_stereo_left: 55565
+  zmq_port_stereo_right: 55566
 
 # =====================================================
 # Left wrist camera configuration
 # =====================================================
 left_wrist_camera:
-  enable_zmq: true
+  enable_zmq: false
   zmq_port : 55556
-  enable_webrtc: true
+  enable_webrtc: false
   webrtc_port : 60002
   webrtc_codec: h264
   type: uvc
   image_shape: [480, 640]
   binocular: false
   fps: 30
-  video_id: 2
-  serial_number: 200901010001
+  video_id: null
+  serial_number: null
   physical_path: null
 
 # =====================================================
 # Right wrist camera configuration
 # =====================================================
 right_wrist_camera:
-  enable_zmq: true
+  enable_zmq: false
   zmq_port : 55557
-  enable_webrtc: true
+  enable_webrtc: false
   webrtc_port: 60003
   webrtc_codec: h264
   type: uvc
   image_shape: [480, 640]
   binocular: false
   fps: 30
-  video_id: 4
-  serial_number: 200901010002
-  physical_path: null
+  video_id: null
+  serial_number: null
+
+
+# =====================================================
+# RealSense example: publish RGB, depth, and IR over ZMQ
+# =====================================================
+# Uncomment and set serial_number to use. Start server with: teleimager-server --rs
+#
+# realsense_head:
+#   enable_zmq: true
+#   zmq_port: 55560              # RGB (JPEG)
+#   enable_webrtc: true
+#   webrtc_port: 60010
+#   webrtc_codec: h264
+#   type: realsense
+#   image_shape: [480, 640]
+#   fps: 30
+#   serial_number: "YOUR_RS_SERIAL"
+#
+#   # Depth stream (raw uint16, same resolution as color)
+#   enable_depth: true           # enables depth in pipeline
+#   enable_zmq_depth: true
+#   zmq_port_depth: 55561
+#
+#   # Infrared stream (raw uint8, left IR, same resolution)
+#   enable_zmq_ir: true
+#   zmq_port_ir: 55562
+#
+#   # Aligned IR: IR warped to color geometry (same H,W as RGB; pixel-aligned with color/depth)
+#   enable_zmq_ir_aligned: true
+#   zmq_port_ir_aligned: 55563
+#
+# Client: connect to zmq_port for JPEG RGB; zmq_port_depth for depth (np.frombuffer(..., dtype=np.uint16).reshape(H,W));
+#          zmq_port_ir for raw IR (np.frombuffer(..., dtype=np.uint8).reshape(H,W));
+#          zmq_port_ir_aligned for aligned IR (same shape, uint8, pixel-aligned with RGB).
